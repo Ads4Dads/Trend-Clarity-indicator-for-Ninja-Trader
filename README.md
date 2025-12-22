@@ -125,7 +125,7 @@ Key configurable areas include:
 - Signal confirmation strictness
 - Overlay panel layout and font size
 
-Defaults are intentionally conservative so you'll need to adjust them based on your instrument and chart time frame. **See example settings**
+Defaults are intentionally conservative so you'll need to adjust them based on your instrument and chart time frame. **See example setting images**
 
 ---
 
