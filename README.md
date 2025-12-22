@@ -106,7 +106,7 @@ Not recommended for:
 
 ## Installation
 
-1. Download `TrendClarityATRPanel.cs`
+1. Download `Ads4DadsTrendClarityATRPanel.cs`
 2. Open **NinjaTrader 8**
 3. Go to **New → NinjaScript Editor**
 4. Right-click → **Import NinjaScript**
