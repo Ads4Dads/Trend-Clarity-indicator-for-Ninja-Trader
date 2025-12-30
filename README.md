@@ -77,13 +77,13 @@ This conservative approach is intentional.
 ## Interpreting the Headline States
 
 - **BUY**  
-  Strong alignment favoring continuation to the upside
+  Strong alignment favoring continuation to the upside. Aim for 60% probability or higher.
 
 - **SELL**  
-  Strong alignment favoring continuation to the downside
+  Strong alignment favoring continuation to the downside. Aim for 60% probability or higher.
 
 - **CAUTION**  
-  Partial alignment or elevated uncertainty
+  Partial alignment or elevated uncertainty.
 
 - **CHOP**  
   No clear directional edge. Standing aside is often best.
