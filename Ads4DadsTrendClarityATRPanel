@@ -13,6 +13,8 @@ using NinjaTrader.Gui.Chart;
 using NinjaTrader.Gui.Tools;
 using NinjaTrader.NinjaScript;
 
+// This execution indicator is designed to operate on a 1 minute chart with at least 5 days to load.
+
 // SharpDX aliases
 using DX = SharpDX;
 using D2D = SharpDX.Direct2D1;
@@ -53,15 +55,6 @@ namespace NinjaTrader.NinjaScript.Indicators
         [Display(Name = "Open Space Threshold (ticks)", GroupName = "General", Order = 6)]
         public int OpenSpaceThresholdTicks { get; set; }
 
-        [NinjaScriptProperty, Display(Name = "VIX Regime Line Enabled", GroupName = "^VIX", Order = 0)]
-        public bool VIXRegimeLineEnabled { get; set; }
-
-        [NinjaScriptProperty, Display(Name = "VIX Calm Max", GroupName = "^VIX", Order = 1)]
-        public double VIXCalmMax { get; set; }
-
-        [NinjaScriptProperty, Display(Name = "VIX Elevated Max", GroupName = "^VIX", Order = 2)]
-        public double VIXElevatedMax { get; set; }
-
         // Overlay layout
         [NinjaScriptProperty, Range(200, 600)]
         [Display(Name = "Overlay Width (px)", GroupName = "Overlay Card", Order = 0)]
@@ -96,6 +89,11 @@ namespace NinjaTrader.NinjaScript.Indicators
         [NinjaScriptProperty, Range(1, 50)]
         [Display(Name = "Momentum Lookback (bars)", GroupName = "Model — Periods", Order = 4)]
         public int MomLookback { get; set; }
+
+        // NEW: Relative volume lookback for participation weighting
+        [NinjaScriptProperty, Range(5, 500)]
+        [Display(Name = "Relative Volume Lookback (bars)", GroupName = "Model — Periods", Order = 5)]
+        public int VolLookback { get; set; }
         #endregion
 
         #region Inputs — Model weights
@@ -110,10 +108,6 @@ namespace NinjaTrader.NinjaScript.Indicators
         [NinjaScriptProperty, Range(0, 100)]
         [Display(Name = "Weight: S/R Room", GroupName = "Model — Weights", Order = 2)]
         public int WtSR { get; set; }
-
-        [NinjaScriptProperty, Range(0, 100)]
-        [Display(Name = "Weight: VIX Regime", GroupName = "Model — Weights", Order = 3)]
-        public int WtVix { get; set; }
 
         [NinjaScriptProperty, Range(0, 100)]
         [Display(Name = "Weight: Net Change", GroupName = "Model — Weights", Order = 4)]
@@ -131,6 +125,11 @@ namespace NinjaTrader.NinjaScript.Indicators
         [NinjaScriptProperty, Range(0, 100)]
         [Display(Name = "Weight: Swing", GroupName = "Model — Weights", Order = 7)]
         public int WtSwing { get; set; }
+
+        // NEW: Volume participation (relative volume × directional efficiency)
+        [NinjaScriptProperty, Range(0, 100)]
+        [Display(Name = "Weight: Volume Participation", GroupName = "Model — Weights", Order = 8)]
+        public int WtVol { get; set; }
         #endregion
 
         #region Inputs — Swing module
@@ -170,7 +169,6 @@ namespace NinjaTrader.NinjaScript.Indicators
         #endregion
 
         #region Private fields
-        private int vixBip = -1;
         private SessionIterator sess;
 
         // S/R tracking
@@ -184,8 +182,6 @@ namespace NinjaTrader.NinjaScript.Indicators
         private double mdLastPrice = double.NaN;
         private double netChangePct;
 
-        private double vixLast;
-        private string vixRegime = "Calm";
 
         // Model
         private string shortState = "NEUTRAL";
@@ -193,6 +189,9 @@ namespace NinjaTrader.NinjaScript.Indicators
         private string longState = "NEUTRAL";
         private int longProb = 50;
 
+
+        private double lastAtrVolScore = 0.0;
+        private string atrVolRegime = "Calm";
         private string headlineState = "CHOP";
         private int headlineProb = 50;
 
@@ -207,13 +206,22 @@ namespace NinjaTrader.NinjaScript.Indicators
         private NinjaTrader.NinjaScript.Indicators.EMA emaFast, emaSlow;
         private NinjaTrader.NinjaScript.Indicators.ATR atrFast, atrSlow;
 
+        // NEW: Relative volume average
+        private NinjaTrader.NinjaScript.Indicators.SMA volSma;
+
         // UI strings
         private string srAboveText = "";
         private string srBelowText = "";
+        private string nearestAboveName = null;
+        private string nearestBelowName = null;
         private int nearestAboveTicks = int.MaxValue;
         private int nearestBelowTicks = int.MaxValue;
-
-        private string lineBadge, lineShort, lineLong, lineNet, lineSwing, lineSignal;
+        private int nearestSRTicks = int.MaxValue;
+        private string lineSR = "";
+        private string lineSpace = "";
+        private bool openSpaceOkDirection = true;
+        private int openSpaceTicksDirection = int.MaxValue;
+private string lineBadge, lineShort, lineLong, lineNet, lineSwing, lineSignal;
 
         private string lastLoggedBadge;
         private string csvPath;
@@ -243,7 +251,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             {
                 Name        = "Ads4DadsTrendClarityATRPanel";
                 Description = "Compact overlay with probabilities, swing, signal, and optional EMA(34) plot.";
-                Calculate   = Calculate.OnEachTick;
+                Calculate   = Calculate.OnBarClose;
                 IsOverlay   = true;
                 IsSuspendedWhileInactive = true;
 
@@ -254,28 +262,26 @@ namespace NinjaTrader.NinjaScript.Indicators
                 SRProximityTicks = 8;
                 ShowOpenSpaceHint = true;
                 OpenSpaceThresholdTicks = 20;
-
-                VIXRegimeLineEnabled = true;
-                VIXCalmMax = 14;
-                VIXElevatedMax = 22;
-
                 OverlayWidth  = 360;
                 OverlayMargin = 10;
                 BaseFontSize  = 14;
 
                 FastEmaPeriod = 5;
-                SlowEmaPeriod = 34;
+                SlowEmaPeriod = 55;
                 FastAtrPeriod = 14;
                 SlowAtrPeriod = 50;
 
-                WtSlope = 45;
-                WtAtr   = 0;
+                WtSlope = 13;
+                WtAtr   = 3;
                 WtSR    = 7;
-                WtVix   = 0;
                 WtNet   = 20;
                 WtPos   = 10;
                 WtMom   = 8;
                 WtSwing = 20;
+
+                // Relative volume defaults
+                VolLookback = 60;
+                WtVol = 3;
 
                 SwingStrengthFast    = 5;
                 SwingStrengthContext = 12;
@@ -292,13 +298,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 
                 AddPlot(new Stroke(Brushes.Cyan, 2), PlotStyle.Line, "EMA34"); // toggled via ShowEMA34
             }
-            else if (State == State.Configure)
-            {
-                AddDataSeries("^VIX", BarsPeriodType.Minute, 1);
-            }
             else if (State == State.DataLoaded)
             {
-                vixBip = 1;
                 sess = new SessionIterator(BarsArray[0]);
 
                 csvPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
@@ -316,6 +317,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 
                 swingFast = Swing(Input, Math.Max(1, SwingStrengthFast));
                 swingCtx  = Swing(Input, Math.Max(1, SwingStrengthContext));
+
+                // NEW: volume SMA for relative volume
+                volSma = SMA(Volume, Math.Max(5, VolLookback));
             }
             else if (State == State.Terminated)
             {
@@ -344,20 +348,9 @@ namespace NinjaTrader.NinjaScript.Indicators
         protected override void OnBarUpdate()
         {
             int need = Math.Max(Math.Max(FastEmaPeriod, SlowEmaPeriod), Math.Max(FastAtrPeriod, SlowAtrPeriod));
+            need = Math.Max(need, Math.Max(5, VolLookback));
             if (CurrentBars[0] < need) { if (ShowEMA34) Values[0][0] = double.NaN; return; }
 
-            if (BarsInProgress == 1 && CurrentBars[1] >= 0)
-            {
-                double v = Closes[1][0];
-                if (v > 0)
-                {
-                    vixLast = v;
-                    vixRegime = (vixLast <= VIXCalmMax) ? "Calm"
-                              : (vixLast <= VIXElevatedMax) ? "Elevated"
-                              : "High Volatility";
-                }
-                return;
-            }
             if (BarsInProgress != 0) return;
 
             // Keep EMA(34) plot (toggle via ShowEMA34)
@@ -521,9 +514,9 @@ namespace NinjaTrader.NinjaScript.Indicators
         #region Model math
         private void ComputeProbabilitiesModel(double swingScore)
         {
-            double wSlope = WtSlope, wAtr = WtAtr, wSR = WtSR, wVix = WtVix, wNet = WtNet, wPos = WtPos, wMom = WtMom, wSwing = WtSwing;
-            double wSum = Math.Max(1.0, wSlope + wAtr + wSR + wVix + wNet + wPos + wMom + wSwing);
-            wSlope/=wSum; wAtr/=wSum; wSR/=wSum; wVix/=wSum; wNet/=wSum; wPos/=wSum; wMom/=wSum; wSwing/=wSum;
+            double wSlope = WtSlope, wAtr = WtAtr, wSR = WtSR, wNet = WtNet, wPos = WtPos, wMom = WtMom, wSwing = WtSwing, wVol = WtVol;
+            double wSum = Math.Max(1.0, wSlope + wAtr + wSR + wNet + wPos + wMom + wSwing + wVol);
+            wSlope/=wSum; wAtr/=wSum; wSR/=wSum; wNet/=wSum; wPos/=wSum; wMom/=wSum; wSwing/=wSum; wVol/=wSum;
 
             double slopeFast = SafeDelta(emaFast, 1) / Math.Max(1e-12, emaFast[0]);
             double slopeSlow = SafeDelta(emaSlow, 1) / Math.Max(1e-12, emaSlow[0]);
@@ -535,6 +528,13 @@ namespace NinjaTrader.NinjaScript.Indicators
             double nAtrFast = Math.Tanh(Math.Abs(atrExpFast) * 10.0) * Math.Sign(nSlopeFast);
             double nAtrSlow = Math.Tanh(Math.Abs(atrExpSlow) * 10.0) * Math.Sign(nSlopeSlow);
 
+
+            // ATR-based volatility regime for panel (derived from normalized ATR terms used in the model)
+            lastAtrVolScore = Math.Max(0.0, Math.Min(1.0, 0.5 * (Math.Abs(nAtrFast) + Math.Abs(nAtrSlow))));
+            atrVolRegime = (lastAtrVolScore < 0.33) ? "Calm"
+                         : (lastAtrVolScore < 0.66) ? "Elevated"
+                         : "Hot";
+
             double srRoom;
             if (nearestAboveTicks == int.MaxValue && nearestBelowTicks == int.MaxValue) srRoom = 0.0;
             else if (nearestAboveTicks == int.MaxValue) srRoom = 1.0;
@@ -545,11 +545,6 @@ namespace NinjaTrader.NinjaScript.Indicators
                 double den = (double)nearestBelowTicks + (double)nearestAboveTicks;
                 srRoom = Math.Tanh((num / Math.Max(1.0, den)) * 2.0);
             }
-
-            double vixScore = 0.0;
-            if (vixRegime == "Calm") vixScore = +0.25;
-            else if (vixRegime == "High Volatility") vixScore = -0.25;
-
             double nNet = Math.Tanh(netChangePct / 0.8);
 
             double pos = 0.0;
@@ -567,6 +562,35 @@ namespace NinjaTrader.NinjaScript.Indicators
                 mom = Math.Tanh(dz);
             }
 
+            // NEW: Relative volume participation (bounded, directional, continuation-friendly)
+            // Idea: reward above-normal participation when price moves efficiently in the trend direction.
+            // - relVol > 1 boosts confidence, relVol < 1 reduces it
+            // - efficiency penalizes chop (big volume but little progress)
+            // - sign aligns with trend direction (uses fast slope sign)
+            double nVol = 0.0;
+            if (volSma != null && volSma.IsValidDataPoint(0))
+            {
+                double avgVol = Math.Max(1.0, volSma[0]);
+                double relVol = Volume[0] / avgVol; // ~1.0 is normal
+
+                // Map relVol into a bounded range around 0
+                // Using (relVol - 1) keeps normal volume near 0 contribution
+                double relCentered = relVol - 1.0;
+
+                // Directional efficiency: progress vs total range (0..1)
+                double rng = Math.Max(TickSize, High[0] - Low[0]);
+                double progress = Math.Abs(Close[0] - Open[0]);
+                double eff = Math.Min(1.0, Math.Max(0.0, progress / rng));
+
+                // Trend direction sign (fallback to candle direction if slope is flat)
+                double dir = Math.Sign(nSlopeFast);
+                if (dir == 0) dir = Math.Sign(Close[0] - Open[0]);
+
+                // Scale and bound; eff dampens noisy volume
+                // 1.6 chosen to make ~2x volume noticeable but not dominating
+                nVol = Math.Tanh(relCentered * 1.6) * eff * dir;
+            }
+
             double breakoutBias = 0.0;
             if (!double.IsNaN(priorDayLow)  && Close[0] < priorDayLow)  breakoutBias -= 0.20;
             if (!double.IsNaN(priorWeekLow) && Close[0] < priorWeekLow) breakoutBias -= 0.20;
@@ -580,10 +604,10 @@ namespace NinjaTrader.NinjaScript.Indicators
                 (wAtr   * 1.00) * nAtrFast  +
                 (wMom   * 1.20) * mom       +
                 (wSR    * 1.00) * srRoom    +
-                (wVix   * 1.00) * vixScore  +
-                (wNet   * 0.80) * nNet      +
+(wNet   * 0.80) * nNet      +
                 (wPos   * 0.50) * pos       +
                 (wSwing * 1.00) * nSwing    +
+                (wVol   * 1.00) * nVol      +
                 breakoutBias;
 
             double longScore  =
@@ -591,14 +615,17 @@ namespace NinjaTrader.NinjaScript.Indicators
                 (wAtr   * 1.00) * nAtrSlow   +
                 (wMom   * 0.60) * mom        +
                 (wSR    * 1.00) * srRoom     +
-                (wVix   * 1.00) * vixScore   +
-                (wNet   * 0.60) * nNet       +
+(wNet   * 0.60) * nNet       +
                 (wPos   * 1.40) * pos        +
                 (wSwing * 0.80) * nSwing     +
+                (wVol   * 1.00) * nVol       +
                 breakoutBias;
 
             shortProb = ToPercent(shortScore);
             longProb  = ToPercent(longScore);
+
+            // SR proximity penalty (Option B) — bounded and applied after probabilities are built.
+            ApplySRProximityPenalty(ref shortProb, ref longProb);
 
             shortState = ProbToState(shortProb);
             longState  = ProbToState(longProb);
@@ -616,7 +643,42 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (p < 5) p = 5; if (p > 95) p = 95;
             return p;
         }
-        private static string ProbToState(int p)
+        
+        private const double MaxSRProximityPenalty = 0.10; // 10% max penalty when at the level
+
+        private static int ClampProb(int p)
+        {
+            if (p < 5) p = 5;
+            if (p > 95) p = 95;
+            return p;
+        }
+
+        // Option B: bounded probability penalty when price is within SRProximityTicks of the nearest tracked S/R level.
+        // This is applied after the model builds probabilities so tuning remains comparable.
+        private void ApplySRProximityPenalty(ref int shortP, ref int longP)
+        {
+            if (SRProximityTicks <= 0)
+                return;
+
+            int nearest = nearestSRTicks;
+            if (nearest == int.MaxValue || nearest > SRProximityTicks)
+                return;
+
+            double ratio = (double)nearest / (double)SRProximityTicks; // 0..1
+            if (ratio < 0.0) ratio = 0.0;
+            if (ratio > 1.0) ratio = 1.0;
+
+            double penalty = (1.0 - ratio) * MaxSRProximityPenalty; // 0..Max
+            if (penalty <= 0.0)
+                return;
+
+            double mult = 1.0 - penalty;
+
+            shortP = ClampProb((int)Math.Round(shortP * mult, MidpointRounding.AwayFromZero));
+            longP  = ClampProb((int)Math.Round(longP  * mult, MidpointRounding.AwayFromZero));
+        }
+
+private static string ProbToState(int p)
         {
             if (p >= 60) return "BUY";
             if (p <= 40) return "SELL";
@@ -638,7 +700,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         private void UpdateBadgeStreaks()
         {
             if (headlineState == "BUY" && headlineProb >= 60) { buyBadgeStreak++; sellBadgeStreak = 0; }
-            else if (headlineState == "SELL" && headlineProb >= 60) { sellBadgeStreak++; buyBadgeStreak = 0; }
+            else if (headlineState == "SELL" && headlineProb <= 40) { sellBadgeStreak++; buyBadgeStreak = 0; }
             else { buyBadgeStreak = 0; sellBadgeStreak = 0; }
         }
 
@@ -653,11 +715,11 @@ namespace NinjaTrader.NinjaScript.Indicators
             bool swingBear = swingLabel == "Bearish";
 
             bool longVeto  = (longProb >= 60 && longState == "BUY");
-            bool shortVeto = (longProb <= 40 && longState == "SELL");
+            bool shortVeto = (shortProb <= 40 && shortState == "SELL");
 
             // Primary triggers
             bool buyReady  = (headlineState == "BUY"  && headlineProb >= 60 && buyBadgeStreak >= 2 && shortProb >= 60 && swingBull && priceAboveEMA && !shortVeto);
-            bool sellReady = (headlineState == "SELL" && headlineProb >= 60 && sellBadgeStreak >= 2 && shortProb <= 40 && swingBear && priceBelowEMA && !longVeto);
+            bool sellReady = (headlineState == "SELL" && headlineProb <= 40 && sellBadgeStreak >= 2 && shortProb <= 40 && swingBear && priceBelowEMA && !longVeto);
 
             // Early entry (optional)
             bool buyEarly = false, sellEarly = false;
@@ -667,7 +729,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 bool crossDown = (emaSlow != null && Close[0] < emaSlow[0] && Close[1] >= emaSlow[1]);
 
                 buyEarly  = (headlineProb >= 55 && headlineProb < 60 && shortProb >= 60 && swingBull && crossUp && !shortVeto);
-                sellEarly = (headlineProb >= 55 && headlineProb < 60 && shortProb <= 40 && swingBear && crossDown && !longVeto);
+                sellEarly = (headlineProb <= 45 && headlineProb > 40 && shortProb <= 40 && swingBear && crossDown && !longVeto);
             }
 
             if (buyReady || buyEarly) signal = "BUY";
@@ -677,6 +739,19 @@ namespace NinjaTrader.NinjaScript.Indicators
         #endregion
 
         #region S/R + strings + CSV
+        private int ComputeNearestSRTicks()
+        {
+            int nearest = int.MaxValue;
+
+            if (nearestAboveTicks != int.MaxValue)
+                nearest = Math.Min(nearest, nearestAboveTicks);
+
+            if (nearestBelowTicks != int.MaxValue)
+                nearest = Math.Min(nearest, nearestBelowTicks);
+
+            return nearest;
+        }
+
         private void UpdateNearestSR()
         {
             double price = Close[0];
@@ -692,11 +767,6 @@ namespace NinjaTrader.NinjaScript.Indicators
             double nearestAboveDist = double.PositiveInfinity; string nearestAboveName = null;
             double nearestBelowDist = double.PositiveInfinity; string nearestBelowName = null;
 
-            bool pdLowBreached  = !double.IsNaN(priorDayLow)  && price < priorDayLow;
-            bool pwLowBreached  = !double.IsNaN(priorWeekLow) && price < priorWeekLow;
-            bool pdHighBreached = !double.IsNaN(priorDayHigh) && price > priorDayHigh;
-            bool pwHighBreached = !double.IsNaN(priorWeekHigh)&& price > priorWeekHigh;
-
             for (int i = 0; i < c.Count; i++)
             {
                 double diff = c[i].Level - price;
@@ -708,54 +778,241 @@ namespace NinjaTrader.NinjaScript.Indicators
                 : (int)Math.Round(nearestAboveDist / TickSize, MidpointRounding.AwayFromZero);
             nearestBelowTicks = (nearestBelowName == null) ? int.MaxValue
                 : (int)Math.Round(nearestBelowDist / TickSize, MidpointRounding.AwayFromZero);
+
+            // Persist names for display
+            this.nearestAboveName = nearestAboveName;
+            this.nearestBelowName = nearestBelowName;
+
+            // Prebuild readable SR distance lines (anchor-based)
+            srAboveText = (nearestAboveName == null) ? "Nearest Above: none"
+                : ("Nearest Above: " + nearestAboveName + " (" + nearestAboveTicks + "t)");
+            srBelowText = (nearestBelowName == null) ? "Nearest Below: none"
+                : ("Nearest Below: " + nearestBelowName + " (" + nearestBelowTicks + "t)");
+
+
+            // Nearest S/R distance in ticks (min of above/below). Used for SR proximity penalty.
+            nearestSRTicks = ComputeNearestSRTicks();
         }
 
         private void BuildDisplayStrings()
         {
-            lineBadge = headlineState + " " + headlineProb + "%";
-            lineShort = "Short-term Trend: " + shortState + " " + shortProb + "%";
-            lineLong  = "Long-term Trend: " + longState  + " " + longProb  + "%";
+            lineBadge = headlineState + " " + (headlineState == "SELL" ? (100 - headlineProb) : headlineProb) + "%";
+            lineShort = "Short-term Trend: " + shortState + " " + (shortState == "SELL" ? (100 - shortProb) : shortProb) + "%";
+            lineLong  = "Long-term Trend: " + longState  + " " + (longState  == "SELL" ? (100 - longProb)  : longProb)  + "%";
             lineNet   = ShowNetChangePercent
                 ? ("Net Change: " + (netChangePct >= 0 ? "+" : "") + Math.Round(netChangePct, 2, MidpointRounding.AwayFromZero).ToString("0.00") + "%")
                 : "";
             lineSwing   = ShowSwingLine  ? ("Swing: " + swingLabel) : "";
             lineSignal  = ShowSignalLine ? ("Signal: " + signal) : "";
-        }
 
-        private void MaybeLogCsv()
-        {
-            if (lineBadge == lastLoggedBadge) return;
-            lastLoggedBadge = lineBadge;
-
-            try
+            // Anchor-based SR distances (optional)
+            lineSR = "";
+            if (ShowSRDistances)
             {
-                bool writeHeader = !File.Exists(csvPath);
-                using (var sw = new StreamWriter(csvPath, true, Encoding.UTF8))
+                // If a directional signal exists, show the nearest barrier in that direction
+                if (string.Equals(signal, "BUY", StringComparison.OrdinalIgnoreCase))
                 {
-                    if (writeHeader)
-                        sw.WriteLine("TimestampET,Instrument,BarType,NetBasisMode,NetChangePct,HeadlineState,HeadlineProb,ShortState,ShortProb,LongState,LongProb,NearestAboveTicks,NearestBelowTicks,VIXRegime,Signal");
-
-                    string barType = BarsPeriod.BarsPeriodType + " " + BarsPeriod.Value;
-                    string ts = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
-                    string instrumentName = (Instrument != null) ? Instrument.FullName : "";
-
-                    sw.WriteLine(string.Join(",",
-                        ts,
-                        instrumentName,
-                        barType,
-                        NetBasisMode,
-                        Math.Round(netChangePct, 4, MidpointRounding.AwayFromZero).ToString(CultureInfo.InvariantCulture),
-                        headlineState, headlineProb,
-                        shortState, shortProb,
-                        longState, longProb,
-                        nearestAboveTicks, nearestBelowTicks,
-                        vixRegime,
-                        signal
-                    ));
+                    lineSR = (nearestAboveName == null) ? "SR: none above" : ("SR: " + nearestAboveName + " in " + nearestAboveTicks + "t");
+                }
+                else if (string.Equals(signal, "SELL", StringComparison.OrdinalIgnoreCase))
+                {
+                    lineSR = (nearestBelowName == null) ? "SR: none below" : ("SR: " + nearestBelowName + " in " + nearestBelowTicks + "t");
+                }
+                else
+                {
+                    lineSR = srAboveText + " | " + srBelowText;
                 }
             }
-            catch { }
+
+            // Open space hint (optional, anchor-based). Uses the nearest barrier in the signal direction.
+            lineSpace = "";
+            openSpaceOkDirection = true;
+            openSpaceTicksDirection = int.MaxValue;
+
+            if (ShowOpenSpaceHint)
+            {
+                if (string.Equals(signal, "BUY", StringComparison.OrdinalIgnoreCase))
+                {
+                    openSpaceTicksDirection = nearestAboveTicks;
+                }
+                else if (string.Equals(signal, "SELL", StringComparison.OrdinalIgnoreCase))
+                {
+                    openSpaceTicksDirection = nearestBelowTicks;
+                }
+                else
+                {
+                    // No directional signal -> no open-space assessment
+                    openSpaceTicksDirection = int.MaxValue;
+                }
+
+                if (openSpaceTicksDirection == int.MaxValue)
+                {
+                    lineSpace = "Open Space: n/a";
+                    openSpaceOkDirection = true;
+                }
+                else
+                {
+                    openSpaceOkDirection = (openSpaceTicksDirection >= OpenSpaceThresholdTicks);
+                    lineSpace = "Open Space: " + (openSpaceOkDirection ? "YES" : "NO") + " (" + openSpaceTicksDirection + "t)";
+                }
+            }
         }
+
+     private void MaybeLogCsv()
+     {
+
+        if (lineBadge == lastLoggedBadge) return;
+        lastLoggedBadge = lineBadge;
+
+        try
+        {
+        bool writeHeader = !File.Exists(csvPath);
+
+        // --- Diagnostics computed for tuning (lightweight) ---
+        double close0   = Close[0];
+        double open0    = Open[0];
+        double high0    = High[0];
+        double low0     = Low[0];
+
+        double emaFast0 = (emaFast != null && emaFast.CurrentBar >= 0) ? emaFast[0] : double.NaN;
+        double emaSlow0 = (emaSlow != null && emaSlow.CurrentBar >= 0) ? emaSlow[0] : double.NaN;
+
+        double atrFast0 = (atrFast != null && atrFast.CurrentBar >= 0) ? atrFast[0] : double.NaN;
+        double atrSlow0 = (atrSlow != null && atrSlow.CurrentBar >= 0) ? atrSlow[0] : double.NaN;
+
+        double vol0     = Volume[0];
+        double avgVol0  = (volSma != null && volSma.IsValidDataPoint(0)) ? volSma[0] : double.NaN;
+
+        double relVol0  = (!double.IsNaN(avgVol0) && avgVol0 > 0) ? (vol0 / avgVol0) : double.NaN;
+
+        double rng0     = Math.Max(TickSize, high0 - low0);
+        double prog0    = Math.Abs(close0 - open0);
+        double eff0     = Math.Min(1.0, Math.Max(0.0, prog0 / rng0)); // 0..1
+
+        string barType  = BarsPeriod.BarsPeriodType + " " + BarsPeriod.Value;
+        string logTs    = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
+        string barTs    = Time[0].ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
+        string instrumentName = (Instrument != null) ? Instrument.FullName : "";
+
+        using (var sw = new StreamWriter(csvPath, true, Encoding.UTF8))
+        {
+            if (writeHeader)
+            {
+                sw.WriteLine(string.Join(",",
+                    // Timestamps / instrument / chart context
+                    "LogTimeET",
+                    "BarTime",
+                    "Instrument",
+                    "BarType",
+
+                    // Core anchors / outputs
+                    "NetBasisMode",
+                    "NetChangePct",
+                    "HeadlineState",
+                    "HeadlineProb",
+                    "ShortState",
+                    "ShortProb",
+                    "LongState",
+                    "LongProb",
+                    "Signal",
+
+                    // S/R context
+                    "NearestAboveTicks",
+                    "NearestBelowTicks",
+
+                    // Price / trend context
+                    "Open",
+                    "High",
+                    "Low",
+                    "Close",
+                    "EmaFast",
+                    "EmaSlow",
+                    "AtrFast",
+                    "AtrSlow",
+
+                    // Relative volume diagnostics
+                    "Volume",
+                    "AvgVolume",
+                    "RelVolume",
+                    "Efficiency",
+
+                    // Model periods (for tuning across TF/instruments)
+                    "FastEmaPeriod",
+                    "SlowEmaPeriod",
+                    "FastAtrPeriod",
+                    "SlowAtrPeriod",
+                    "MomLookback",
+                    "VolLookback",
+
+                    // Weights
+                    "WtSlope",
+                    "WtAtr",
+                    "WtSR",
+                    "WtNet",
+                    "WtPos",
+                    "WtMom",
+                    "WtSwing",
+                    "WtVol"
+                ));
+            }
+
+            sw.WriteLine(string.Join(",",
+                logTs,
+                barTs,
+                instrumentName,
+                barType,
+
+                NetBasisMode.ToString(CultureInfo.InvariantCulture),
+                Math.Round(netChangePct, 4, MidpointRounding.AwayFromZero).ToString(CultureInfo.InvariantCulture),
+                headlineState,
+                headlineProb.ToString(CultureInfo.InvariantCulture),
+                shortState,
+                shortProb.ToString(CultureInfo.InvariantCulture),
+                longState,
+                longProb.ToString(CultureInfo.InvariantCulture),
+                signal,
+
+                nearestAboveTicks.ToString(CultureInfo.InvariantCulture),
+                nearestBelowTicks.ToString(CultureInfo.InvariantCulture),
+
+                Math.Round(open0,  2, MidpointRounding.AwayFromZero).ToString(CultureInfo.InvariantCulture),
+                Math.Round(high0,  2, MidpointRounding.AwayFromZero).ToString(CultureInfo.InvariantCulture),
+                Math.Round(low0,   2, MidpointRounding.AwayFromZero).ToString(CultureInfo.InvariantCulture),
+                Math.Round(close0, 2, MidpointRounding.AwayFromZero).ToString(CultureInfo.InvariantCulture),
+                (double.IsNaN(emaFast0) ? "" : Math.Round(emaFast0, 2, MidpointRounding.AwayFromZero).ToString(CultureInfo.InvariantCulture)),
+                (double.IsNaN(emaSlow0) ? "" : Math.Round(emaSlow0, 2, MidpointRounding.AwayFromZero).ToString(CultureInfo.InvariantCulture)),
+                (double.IsNaN(atrFast0) ? "" : Math.Round(atrFast0, 4, MidpointRounding.AwayFromZero).ToString(CultureInfo.InvariantCulture)),
+                (double.IsNaN(atrSlow0) ? "" : Math.Round(atrSlow0, 4, MidpointRounding.AwayFromZero).ToString(CultureInfo.InvariantCulture)),
+
+                Math.Round(vol0, 0, MidpointRounding.AwayFromZero).ToString(CultureInfo.InvariantCulture),
+                (double.IsNaN(avgVol0) ? "" : Math.Round(avgVol0, 2, MidpointRounding.AwayFromZero).ToString(CultureInfo.InvariantCulture)),
+                (double.IsNaN(relVol0) ? "" : Math.Round(relVol0, 4, MidpointRounding.AwayFromZero).ToString(CultureInfo.InvariantCulture)),
+                Math.Round(eff0, 4, MidpointRounding.AwayFromZero).ToString(CultureInfo.InvariantCulture),
+
+                FastEmaPeriod.ToString(CultureInfo.InvariantCulture),
+                SlowEmaPeriod.ToString(CultureInfo.InvariantCulture),
+                FastAtrPeriod.ToString(CultureInfo.InvariantCulture),
+                SlowAtrPeriod.ToString(CultureInfo.InvariantCulture),
+                MomLookback.ToString(CultureInfo.InvariantCulture),
+                VolLookback.ToString(CultureInfo.InvariantCulture),
+
+                WtSlope.ToString(CultureInfo.InvariantCulture),
+                WtAtr.ToString(CultureInfo.InvariantCulture),
+                WtSR.ToString(CultureInfo.InvariantCulture),
+                WtNet.ToString(CultureInfo.InvariantCulture),
+                WtPos.ToString(CultureInfo.InvariantCulture),
+                WtMom.ToString(CultureInfo.InvariantCulture),
+                WtSwing.ToString(CultureInfo.InvariantCulture),
+                WtVol.ToString(CultureInfo.InvariantCulture)
+            ));
+        }
+    }
+    catch
+    {
+        // swallow logging errors (your current pattern)
+    }
+}
+
         #endregion
 
         #region Rendering — overlay card
@@ -772,7 +1029,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             float x = ChartPanel.X + OverlayMargin;
             float bottom = ChartPanel.Y + ChartPanel.H - OverlayMargin;
 
-            string vixLine = VIXRegimeLineEnabled ? ("VIX Regime: " + vixRegime) : "";
+            string atrLine = "Volatility (ATR): " + atrVolRegime;
 
             using (var badgeLayout = new DW.TextLayout(dwFactory, lineBadge ?? "", tfBadge, width - cardPadding * 2, tfBadge.FontSize * 2.0f))
             using (var shLayout    = new DW.TextLayout(dwFactory, lineShort ?? "", tfLine,  width - 20f, tfLine.FontSize * 1.5f))
@@ -780,7 +1037,9 @@ namespace NinjaTrader.NinjaScript.Indicators
             using (var netLayout   = new DW.TextLayout(dwFactory, lineNet   ?? "", tfLine,  width - 20f, tfLine.FontSize * 1.5f))
             using (var swLayout    = new DW.TextLayout(dwFactory, lineSwing ?? "", tfLine,  width - 20f, tfLine.FontSize * 1.5f))
             using (var sigLayout   = new DW.TextLayout(dwFactory, lineSignal?? "", tfLine,  width - 20f, tfLine.FontSize * 1.5f))
-            using (var vixLayout   = new DW.TextLayout(dwFactory, vixLine, tfLine, width - 20f, tfLine.FontSize * 1.5f))
+            using (var srLayout    = new DW.TextLayout(dwFactory, lineSR ?? "", tfLine,  width - 20f, tfLine.FontSize * 1.5f))
+            using (var spLayout    = new DW.TextLayout(dwFactory, lineSpace ?? "", tfLine,  width - 20f, tfLine.FontSize * 1.5f))
+            using (var atrLayout   = new DW.TextLayout(dwFactory, atrLine, tfLine, width - 20f, tfLine.FontSize * 1.5f))
             {
                 float badgeH = tfBadge.FontSize * 1.8f + 6f;
                 float h = cardPadding + badgeH + lineGap + 2f
@@ -790,9 +1049,9 @@ namespace NinjaTrader.NinjaScript.Indicators
                 if (!string.IsNullOrEmpty(lineNet))     h += lineGap + (float)Math.Ceiling(netLayout.Metrics.Height);
                 if (!string.IsNullOrEmpty(lineSwing))   h += lineGap + (float)Math.Ceiling(swLayout.Metrics.Height);
                 if (!string.IsNullOrEmpty(lineSignal))  h += lineGap + (float)Math.Ceiling(sigLayout.Metrics.Height);
-                if (!string.IsNullOrEmpty(vixLine))     h += lineGap + (float)Math.Ceiling(vixLayout.Metrics.Height);
-
-                h += cardPadding;
+                if (!string.IsNullOrEmpty(lineSR))      h += lineGap + (float)Math.Ceiling(srLayout.Metrics.Height);
+                if (!string.IsNullOrEmpty(lineSpace))   h += lineGap + (float)Math.Ceiling(spLayout.Metrics.Height);
+                h += lineGap + (float)Math.Ceiling(atrLayout.Metrics.Height);h += cardPadding;
 
                 float top = bottom - h;
                 float minTop = ChartPanel.Y + OverlayMargin;
@@ -830,9 +1089,22 @@ namespace NinjaTrader.NinjaScript.Indicators
                     ty += (float)Math.Ceiling(sigLayout.Metrics.Height) + lineGap;
                 }
 
-                if (!string.IsNullOrEmpty(vixLine))
-                    RenderTarget.DrawTextLayout(new DX.Vector2(tx, ty), vixLayout, textBrush);
-            }
+                if (!string.IsNullOrEmpty(lineSR))
+                {
+                    RenderTarget.DrawTextLayout(new DX.Vector2(tx, ty), srLayout, textBrush);
+                    ty += (float)Math.Ceiling(srLayout.Metrics.Height) + lineGap;
+                }
+
+                if (!string.IsNullOrEmpty(lineSpace))
+                {
+                    D2D.Brush spBrush = textBrush;
+                    if (ShowOpenSpaceHint && openSpaceTicksDirection != int.MaxValue && !openSpaceOkDirection)
+                        spBrush = warnAmber;
+                    RenderTarget.DrawTextLayout(new DX.Vector2(tx, ty), spLayout, spBrush);
+                    ty += (float)Math.Ceiling(spLayout.Metrics.Height) + lineGap;
+                }
+
+                RenderTarget.DrawTextLayout(new DX.Vector2(tx, ty), atrLayout, textBrush);}
         }
 
         public override void OnRenderTargetChanged()
@@ -919,18 +1191,18 @@ namespace NinjaTrader.NinjaScript.Indicators
 	public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
 	{
 		private TrendClarityATRPanel[] cacheTrendClarityATRPanel;
-		public TrendClarityATRPanel TrendClarityATRPanel(int netBasisMode, bool showNetChangePercent, bool showSRDistances, int sRProximityTicks, bool showOpenSpaceHint, int openSpaceThresholdTicks, bool vIXRegimeLineEnabled, double vIXCalmMax, double vIXElevatedMax, int overlayWidth, int overlayMargin, int baseFontSize, int fastEmaPeriod, int slowEmaPeriod, int fastAtrPeriod, int slowAtrPeriod, int momLookback, int wtSlope, int wtAtr, int wtSR, int wtVix, int wtNet, int wtPos, int wtMom, int wtSwing, int swingStrengthFast, int swingStrengthContext, int swingBufferTicks, int swingConfirmBars, int swingCooldownBars, bool showSwingLine, bool showSignalLine, bool enableEarlyEntry, bool showEMA34)
+		public TrendClarityATRPanel TrendClarityATRPanel(int netBasisMode, bool showNetChangePercent, bool showSRDistances, int sRProximityTicks, bool showOpenSpaceHint, int openSpaceThresholdTicks, int overlayWidth, int overlayMargin, int baseFontSize, int fastEmaPeriod, int slowEmaPeriod, int fastAtrPeriod, int slowAtrPeriod, int momLookback, int volLookback, int wtSlope, int wtAtr, int wtSR, int wtNet, int wtPos, int wtMom, int wtSwing, int wtVol, int swingStrengthFast, int swingStrengthContext, int swingBufferTicks, int swingConfirmBars, int swingCooldownBars, bool showSwingLine, bool showSignalLine, bool enableEarlyEntry, bool showEMA34)
 		{
-			return TrendClarityATRPanel(Input, netBasisMode, showNetChangePercent, showSRDistances, sRProximityTicks, showOpenSpaceHint, openSpaceThresholdTicks, vIXRegimeLineEnabled, vIXCalmMax, vIXElevatedMax, overlayWidth, overlayMargin, baseFontSize, fastEmaPeriod, slowEmaPeriod, fastAtrPeriod, slowAtrPeriod, momLookback, wtSlope, wtAtr, wtSR, wtVix, wtNet, wtPos, wtMom, wtSwing, swingStrengthFast, swingStrengthContext, swingBufferTicks, swingConfirmBars, swingCooldownBars, showSwingLine, showSignalLine, enableEarlyEntry, showEMA34);
+			return TrendClarityATRPanel(Input, netBasisMode, showNetChangePercent, showSRDistances, sRProximityTicks, showOpenSpaceHint, openSpaceThresholdTicks, overlayWidth, overlayMargin, baseFontSize, fastEmaPeriod, slowEmaPeriod, fastAtrPeriod, slowAtrPeriod, momLookback, volLookback, wtSlope, wtAtr, wtSR, wtNet, wtPos, wtMom, wtSwing, wtVol, swingStrengthFast, swingStrengthContext, swingBufferTicks, swingConfirmBars, swingCooldownBars, showSwingLine, showSignalLine, enableEarlyEntry, showEMA34);
 		}
 
-		public TrendClarityATRPanel TrendClarityATRPanel(ISeries<double> input, int netBasisMode, bool showNetChangePercent, bool showSRDistances, int sRProximityTicks, bool showOpenSpaceHint, int openSpaceThresholdTicks, bool vIXRegimeLineEnabled, double vIXCalmMax, double vIXElevatedMax, int overlayWidth, int overlayMargin, int baseFontSize, int fastEmaPeriod, int slowEmaPeriod, int fastAtrPeriod, int slowAtrPeriod, int momLookback, int wtSlope, int wtAtr, int wtSR, int wtVix, int wtNet, int wtPos, int wtMom, int wtSwing, int swingStrengthFast, int swingStrengthContext, int swingBufferTicks, int swingConfirmBars, int swingCooldownBars, bool showSwingLine, bool showSignalLine, bool enableEarlyEntry, bool showEMA34)
+		public TrendClarityATRPanel TrendClarityATRPanel(ISeries<double> input, int netBasisMode, bool showNetChangePercent, bool showSRDistances, int sRProximityTicks, bool showOpenSpaceHint, int openSpaceThresholdTicks, int overlayWidth, int overlayMargin, int baseFontSize, int fastEmaPeriod, int slowEmaPeriod, int fastAtrPeriod, int slowAtrPeriod, int momLookback, int volLookback, int wtSlope, int wtAtr, int wtSR, int wtNet, int wtPos, int wtMom, int wtSwing, int wtVol, int swingStrengthFast, int swingStrengthContext, int swingBufferTicks, int swingConfirmBars, int swingCooldownBars, bool showSwingLine, bool showSignalLine, bool enableEarlyEntry, bool showEMA34)
 		{
 			if (cacheTrendClarityATRPanel != null)
 				for (int idx = 0; idx < cacheTrendClarityATRPanel.Length; idx++)
-					if (cacheTrendClarityATRPanel[idx] != null && cacheTrendClarityATRPanel[idx].NetBasisMode == netBasisMode && cacheTrendClarityATRPanel[idx].ShowNetChangePercent == showNetChangePercent && cacheTrendClarityATRPanel[idx].ShowSRDistances == showSRDistances && cacheTrendClarityATRPanel[idx].SRProximityTicks == sRProximityTicks && cacheTrendClarityATRPanel[idx].ShowOpenSpaceHint == showOpenSpaceHint && cacheTrendClarityATRPanel[idx].OpenSpaceThresholdTicks == openSpaceThresholdTicks && cacheTrendClarityATRPanel[idx].VIXRegimeLineEnabled == vIXRegimeLineEnabled && cacheTrendClarityATRPanel[idx].VIXCalmMax == vIXCalmMax && cacheTrendClarityATRPanel[idx].VIXElevatedMax == vIXElevatedMax && cacheTrendClarityATRPanel[idx].OverlayWidth == overlayWidth && cacheTrendClarityATRPanel[idx].OverlayMargin == overlayMargin && cacheTrendClarityATRPanel[idx].BaseFontSize == baseFontSize && cacheTrendClarityATRPanel[idx].FastEmaPeriod == fastEmaPeriod && cacheTrendClarityATRPanel[idx].SlowEmaPeriod == slowEmaPeriod && cacheTrendClarityATRPanel[idx].FastAtrPeriod == fastAtrPeriod && cacheTrendClarityATRPanel[idx].SlowAtrPeriod == slowAtrPeriod && cacheTrendClarityATRPanel[idx].MomLookback == momLookback && cacheTrendClarityATRPanel[idx].WtSlope == wtSlope && cacheTrendClarityATRPanel[idx].WtAtr == wtAtr && cacheTrendClarityATRPanel[idx].WtSR == wtSR && cacheTrendClarityATRPanel[idx].WtVix == wtVix && cacheTrendClarityATRPanel[idx].WtNet == wtNet && cacheTrendClarityATRPanel[idx].WtPos == wtPos && cacheTrendClarityATRPanel[idx].WtMom == wtMom && cacheTrendClarityATRPanel[idx].WtSwing == wtSwing && cacheTrendClarityATRPanel[idx].SwingStrengthFast == swingStrengthFast && cacheTrendClarityATRPanel[idx].SwingStrengthContext == swingStrengthContext && cacheTrendClarityATRPanel[idx].SwingBufferTicks == swingBufferTicks && cacheTrendClarityATRPanel[idx].SwingConfirmBars == swingConfirmBars && cacheTrendClarityATRPanel[idx].SwingCooldownBars == swingCooldownBars && cacheTrendClarityATRPanel[idx].ShowSwingLine == showSwingLine && cacheTrendClarityATRPanel[idx].ShowSignalLine == showSignalLine && cacheTrendClarityATRPanel[idx].EnableEarlyEntry == enableEarlyEntry && cacheTrendClarityATRPanel[idx].ShowEMA34 == showEMA34 && cacheTrendClarityATRPanel[idx].EqualsInput(input))
+					if (cacheTrendClarityATRPanel[idx] != null && cacheTrendClarityATRPanel[idx].NetBasisMode == netBasisMode && cacheTrendClarityATRPanel[idx].ShowNetChangePercent == showNetChangePercent && cacheTrendClarityATRPanel[idx].ShowSRDistances == showSRDistances && cacheTrendClarityATRPanel[idx].SRProximityTicks == sRProximityTicks && cacheTrendClarityATRPanel[idx].ShowOpenSpaceHint == showOpenSpaceHint && cacheTrendClarityATRPanel[idx].OpenSpaceThresholdTicks == openSpaceThresholdTicks && cacheTrendClarityATRPanel[idx].OverlayWidth == overlayWidth && cacheTrendClarityATRPanel[idx].OverlayMargin == overlayMargin && cacheTrendClarityATRPanel[idx].BaseFontSize == baseFontSize && cacheTrendClarityATRPanel[idx].FastEmaPeriod == fastEmaPeriod && cacheTrendClarityATRPanel[idx].SlowEmaPeriod == slowEmaPeriod && cacheTrendClarityATRPanel[idx].FastAtrPeriod == fastAtrPeriod && cacheTrendClarityATRPanel[idx].SlowAtrPeriod == slowAtrPeriod && cacheTrendClarityATRPanel[idx].MomLookback == momLookback && cacheTrendClarityATRPanel[idx].VolLookback == volLookback && cacheTrendClarityATRPanel[idx].WtSlope == wtSlope && cacheTrendClarityATRPanel[idx].WtAtr == wtAtr && cacheTrendClarityATRPanel[idx].WtSR == wtSR && cacheTrendClarityATRPanel[idx].WtNet == wtNet && cacheTrendClarityATRPanel[idx].WtPos == wtPos && cacheTrendClarityATRPanel[idx].WtMom == wtMom && cacheTrendClarityATRPanel[idx].WtSwing == wtSwing && cacheTrendClarityATRPanel[idx].WtVol == wtVol && cacheTrendClarityATRPanel[idx].SwingStrengthFast == swingStrengthFast && cacheTrendClarityATRPanel[idx].SwingStrengthContext == swingStrengthContext && cacheTrendClarityATRPanel[idx].SwingBufferTicks == swingBufferTicks && cacheTrendClarityATRPanel[idx].SwingConfirmBars == swingConfirmBars && cacheTrendClarityATRPanel[idx].SwingCooldownBars == swingCooldownBars && cacheTrendClarityATRPanel[idx].ShowSwingLine == showSwingLine && cacheTrendClarityATRPanel[idx].ShowSignalLine == showSignalLine && cacheTrendClarityATRPanel[idx].EnableEarlyEntry == enableEarlyEntry && cacheTrendClarityATRPanel[idx].ShowEMA34 == showEMA34 && cacheTrendClarityATRPanel[idx].EqualsInput(input))
 						return cacheTrendClarityATRPanel[idx];
-			return CacheIndicator<TrendClarityATRPanel>(new TrendClarityATRPanel(){ NetBasisMode = netBasisMode, ShowNetChangePercent = showNetChangePercent, ShowSRDistances = showSRDistances, SRProximityTicks = sRProximityTicks, ShowOpenSpaceHint = showOpenSpaceHint, OpenSpaceThresholdTicks = openSpaceThresholdTicks, VIXRegimeLineEnabled = vIXRegimeLineEnabled, VIXCalmMax = vIXCalmMax, VIXElevatedMax = vIXElevatedMax, OverlayWidth = overlayWidth, OverlayMargin = overlayMargin, BaseFontSize = baseFontSize, FastEmaPeriod = fastEmaPeriod, SlowEmaPeriod = slowEmaPeriod, FastAtrPeriod = fastAtrPeriod, SlowAtrPeriod = slowAtrPeriod, MomLookback = momLookback, WtSlope = wtSlope, WtAtr = wtAtr, WtSR = wtSR, WtVix = wtVix, WtNet = wtNet, WtPos = wtPos, WtMom = wtMom, WtSwing = wtSwing, SwingStrengthFast = swingStrengthFast, SwingStrengthContext = swingStrengthContext, SwingBufferTicks = swingBufferTicks, SwingConfirmBars = swingConfirmBars, SwingCooldownBars = swingCooldownBars, ShowSwingLine = showSwingLine, ShowSignalLine = showSignalLine, EnableEarlyEntry = enableEarlyEntry, ShowEMA34 = showEMA34 }, input, ref cacheTrendClarityATRPanel);
+			return CacheIndicator<TrendClarityATRPanel>(new TrendClarityATRPanel(){ NetBasisMode = netBasisMode, ShowNetChangePercent = showNetChangePercent, ShowSRDistances = showSRDistances, SRProximityTicks = sRProximityTicks, ShowOpenSpaceHint = showOpenSpaceHint, OpenSpaceThresholdTicks = openSpaceThresholdTicks, OverlayWidth = overlayWidth, OverlayMargin = overlayMargin, BaseFontSize = baseFontSize, FastEmaPeriod = fastEmaPeriod, SlowEmaPeriod = slowEmaPeriod, FastAtrPeriod = fastAtrPeriod, SlowAtrPeriod = slowAtrPeriod, MomLookback = momLookback, VolLookback = volLookback, WtSlope = wtSlope, WtAtr = wtAtr, WtSR = wtSR, WtNet = wtNet, WtPos = wtPos, WtMom = wtMom, WtSwing = wtSwing, WtVol = wtVol, SwingStrengthFast = swingStrengthFast, SwingStrengthContext = swingStrengthContext, SwingBufferTicks = swingBufferTicks, SwingConfirmBars = swingConfirmBars, SwingCooldownBars = swingCooldownBars, ShowSwingLine = showSwingLine, ShowSignalLine = showSignalLine, EnableEarlyEntry = enableEarlyEntry, ShowEMA34 = showEMA34 }, input, ref cacheTrendClarityATRPanel);
 		}
 	}
 }
@@ -939,14 +1211,14 @@ namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
 {
 	public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
 	{
-		public Indicators.TrendClarityATRPanel TrendClarityATRPanel(int netBasisMode, bool showNetChangePercent, bool showSRDistances, int sRProximityTicks, bool showOpenSpaceHint, int openSpaceThresholdTicks, bool vIXRegimeLineEnabled, double vIXCalmMax, double vIXElevatedMax, int overlayWidth, int overlayMargin, int baseFontSize, int fastEmaPeriod, int slowEmaPeriod, int fastAtrPeriod, int slowAtrPeriod, int momLookback, int wtSlope, int wtAtr, int wtSR, int wtVix, int wtNet, int wtPos, int wtMom, int wtSwing, int swingStrengthFast, int swingStrengthContext, int swingBufferTicks, int swingConfirmBars, int swingCooldownBars, bool showSwingLine, bool showSignalLine, bool enableEarlyEntry, bool showEMA34)
+		public Indicators.TrendClarityATRPanel TrendClarityATRPanel(int netBasisMode, bool showNetChangePercent, bool showSRDistances, int sRProximityTicks, bool showOpenSpaceHint, int openSpaceThresholdTicks, int overlayWidth, int overlayMargin, int baseFontSize, int fastEmaPeriod, int slowEmaPeriod, int fastAtrPeriod, int slowAtrPeriod, int momLookback, int volLookback, int wtSlope, int wtAtr, int wtSR, int wtNet, int wtPos, int wtMom, int wtSwing, int wtVol, int swingStrengthFast, int swingStrengthContext, int swingBufferTicks, int swingConfirmBars, int swingCooldownBars, bool showSwingLine, bool showSignalLine, bool enableEarlyEntry, bool showEMA34)
 		{
-			return indicator.TrendClarityATRPanel(Input, netBasisMode, showNetChangePercent, showSRDistances, sRProximityTicks, showOpenSpaceHint, openSpaceThresholdTicks, vIXRegimeLineEnabled, vIXCalmMax, vIXElevatedMax, overlayWidth, overlayMargin, baseFontSize, fastEmaPeriod, slowEmaPeriod, fastAtrPeriod, slowAtrPeriod, momLookback, wtSlope, wtAtr, wtSR, wtVix, wtNet, wtPos, wtMom, wtSwing, swingStrengthFast, swingStrengthContext, swingBufferTicks, swingConfirmBars, swingCooldownBars, showSwingLine, showSignalLine, enableEarlyEntry, showEMA34);
+			return indicator.TrendClarityATRPanel(Input, netBasisMode, showNetChangePercent, showSRDistances, sRProximityTicks, showOpenSpaceHint, openSpaceThresholdTicks, overlayWidth, overlayMargin, baseFontSize, fastEmaPeriod, slowEmaPeriod, fastAtrPeriod, slowAtrPeriod, momLookback, volLookback, wtSlope, wtAtr, wtSR, wtNet, wtPos, wtMom, wtSwing, wtVol, swingStrengthFast, swingStrengthContext, swingBufferTicks, swingConfirmBars, swingCooldownBars, showSwingLine, showSignalLine, enableEarlyEntry, showEMA34);
 		}
 
-		public Indicators.TrendClarityATRPanel TrendClarityATRPanel(ISeries<double> input , int netBasisMode, bool showNetChangePercent, bool showSRDistances, int sRProximityTicks, bool showOpenSpaceHint, int openSpaceThresholdTicks, bool vIXRegimeLineEnabled, double vIXCalmMax, double vIXElevatedMax, int overlayWidth, int overlayMargin, int baseFontSize, int fastEmaPeriod, int slowEmaPeriod, int fastAtrPeriod, int slowAtrPeriod, int momLookback, int wtSlope, int wtAtr, int wtSR, int wtVix, int wtNet, int wtPos, int wtMom, int wtSwing, int swingStrengthFast, int swingStrengthContext, int swingBufferTicks, int swingConfirmBars, int swingCooldownBars, bool showSwingLine, bool showSignalLine, bool enableEarlyEntry, bool showEMA34)
+		public Indicators.TrendClarityATRPanel TrendClarityATRPanel(ISeries<double> input , int netBasisMode, bool showNetChangePercent, bool showSRDistances, int sRProximityTicks, bool showOpenSpaceHint, int openSpaceThresholdTicks, int overlayWidth, int overlayMargin, int baseFontSize, int fastEmaPeriod, int slowEmaPeriod, int fastAtrPeriod, int slowAtrPeriod, int momLookback, int volLookback, int wtSlope, int wtAtr, int wtSR, int wtNet, int wtPos, int wtMom, int wtSwing, int wtVol, int swingStrengthFast, int swingStrengthContext, int swingBufferTicks, int swingConfirmBars, int swingCooldownBars, bool showSwingLine, bool showSignalLine, bool enableEarlyEntry, bool showEMA34)
 		{
-			return indicator.TrendClarityATRPanel(input, netBasisMode, showNetChangePercent, showSRDistances, sRProximityTicks, showOpenSpaceHint, openSpaceThresholdTicks, vIXRegimeLineEnabled, vIXCalmMax, vIXElevatedMax, overlayWidth, overlayMargin, baseFontSize, fastEmaPeriod, slowEmaPeriod, fastAtrPeriod, slowAtrPeriod, momLookback, wtSlope, wtAtr, wtSR, wtVix, wtNet, wtPos, wtMom, wtSwing, swingStrengthFast, swingStrengthContext, swingBufferTicks, swingConfirmBars, swingCooldownBars, showSwingLine, showSignalLine, enableEarlyEntry, showEMA34);
+			return indicator.TrendClarityATRPanel(input, netBasisMode, showNetChangePercent, showSRDistances, sRProximityTicks, showOpenSpaceHint, openSpaceThresholdTicks, overlayWidth, overlayMargin, baseFontSize, fastEmaPeriod, slowEmaPeriod, fastAtrPeriod, slowAtrPeriod, momLookback, volLookback, wtSlope, wtAtr, wtSR, wtNet, wtPos, wtMom, wtSwing, wtVol, swingStrengthFast, swingStrengthContext, swingBufferTicks, swingConfirmBars, swingCooldownBars, showSwingLine, showSignalLine, enableEarlyEntry, showEMA34);
 		}
 	}
 }
@@ -955,14 +1227,14 @@ namespace NinjaTrader.NinjaScript.Strategies
 {
 	public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
 	{
-		public Indicators.TrendClarityATRPanel TrendClarityATRPanel(int netBasisMode, bool showNetChangePercent, bool showSRDistances, int sRProximityTicks, bool showOpenSpaceHint, int openSpaceThresholdTicks, bool vIXRegimeLineEnabled, double vIXCalmMax, double vIXElevatedMax, int overlayWidth, int overlayMargin, int baseFontSize, int fastEmaPeriod, int slowEmaPeriod, int fastAtrPeriod, int slowAtrPeriod, int momLookback, int wtSlope, int wtAtr, int wtSR, int wtVix, int wtNet, int wtPos, int wtMom, int wtSwing, int swingStrengthFast, int swingStrengthContext, int swingBufferTicks, int swingConfirmBars, int swingCooldownBars, bool showSwingLine, bool showSignalLine, bool enableEarlyEntry, bool showEMA34)
+		public Indicators.TrendClarityATRPanel TrendClarityATRPanel(int netBasisMode, bool showNetChangePercent, bool showSRDistances, int sRProximityTicks, bool showOpenSpaceHint, int openSpaceThresholdTicks, int overlayWidth, int overlayMargin, int baseFontSize, int fastEmaPeriod, int slowEmaPeriod, int fastAtrPeriod, int slowAtrPeriod, int momLookback, int volLookback, int wtSlope, int wtAtr, int wtSR, int wtNet, int wtPos, int wtMom, int wtSwing, int wtVol, int swingStrengthFast, int swingStrengthContext, int swingBufferTicks, int swingConfirmBars, int swingCooldownBars, bool showSwingLine, bool showSignalLine, bool enableEarlyEntry, bool showEMA34)
 		{
-			return indicator.TrendClarityATRPanel(Input, netBasisMode, showNetChangePercent, showSRDistances, sRProximityTicks, showOpenSpaceHint, openSpaceThresholdTicks, vIXRegimeLineEnabled, vIXCalmMax, vIXElevatedMax, overlayWidth, overlayMargin, baseFontSize, fastEmaPeriod, slowEmaPeriod, fastAtrPeriod, slowAtrPeriod, momLookback, wtSlope, wtAtr, wtSR, wtVix, wtNet, wtPos, wtMom, wtSwing, swingStrengthFast, swingStrengthContext, swingBufferTicks, swingConfirmBars, swingCooldownBars, showSwingLine, showSignalLine, enableEarlyEntry, showEMA34);
+			return indicator.TrendClarityATRPanel(Input, netBasisMode, showNetChangePercent, showSRDistances, sRProximityTicks, showOpenSpaceHint, openSpaceThresholdTicks, overlayWidth, overlayMargin, baseFontSize, fastEmaPeriod, slowEmaPeriod, fastAtrPeriod, slowAtrPeriod, momLookback, volLookback, wtSlope, wtAtr, wtSR, wtNet, wtPos, wtMom, wtSwing, wtVol, swingStrengthFast, swingStrengthContext, swingBufferTicks, swingConfirmBars, swingCooldownBars, showSwingLine, showSignalLine, enableEarlyEntry, showEMA34);
 		}
 
-		public Indicators.TrendClarityATRPanel TrendClarityATRPanel(ISeries<double> input , int netBasisMode, bool showNetChangePercent, bool showSRDistances, int sRProximityTicks, bool showOpenSpaceHint, int openSpaceThresholdTicks, bool vIXRegimeLineEnabled, double vIXCalmMax, double vIXElevatedMax, int overlayWidth, int overlayMargin, int baseFontSize, int fastEmaPeriod, int slowEmaPeriod, int fastAtrPeriod, int slowAtrPeriod, int momLookback, int wtSlope, int wtAtr, int wtSR, int wtVix, int wtNet, int wtPos, int wtMom, int wtSwing, int swingStrengthFast, int swingStrengthContext, int swingBufferTicks, int swingConfirmBars, int swingCooldownBars, bool showSwingLine, bool showSignalLine, bool enableEarlyEntry, bool showEMA34)
+		public Indicators.TrendClarityATRPanel TrendClarityATRPanel(ISeries<double> input , int netBasisMode, bool showNetChangePercent, bool showSRDistances, int sRProximityTicks, bool showOpenSpaceHint, int openSpaceThresholdTicks, int overlayWidth, int overlayMargin, int baseFontSize, int fastEmaPeriod, int slowEmaPeriod, int fastAtrPeriod, int slowAtrPeriod, int momLookback, int volLookback, int wtSlope, int wtAtr, int wtSR, int wtNet, int wtPos, int wtMom, int wtSwing, int wtVol, int swingStrengthFast, int swingStrengthContext, int swingBufferTicks, int swingConfirmBars, int swingCooldownBars, bool showSwingLine, bool showSignalLine, bool enableEarlyEntry, bool showEMA34)
 		{
-			return indicator.TrendClarityATRPanel(input, netBasisMode, showNetChangePercent, showSRDistances, sRProximityTicks, showOpenSpaceHint, openSpaceThresholdTicks, vIXRegimeLineEnabled, vIXCalmMax, vIXElevatedMax, overlayWidth, overlayMargin, baseFontSize, fastEmaPeriod, slowEmaPeriod, fastAtrPeriod, slowAtrPeriod, momLookback, wtSlope, wtAtr, wtSR, wtVix, wtNet, wtPos, wtMom, wtSwing, swingStrengthFast, swingStrengthContext, swingBufferTicks, swingConfirmBars, swingCooldownBars, showSwingLine, showSignalLine, enableEarlyEntry, showEMA34);
+			return indicator.TrendClarityATRPanel(input, netBasisMode, showNetChangePercent, showSRDistances, sRProximityTicks, showOpenSpaceHint, openSpaceThresholdTicks, overlayWidth, overlayMargin, baseFontSize, fastEmaPeriod, slowEmaPeriod, fastAtrPeriod, slowAtrPeriod, momLookback, volLookback, wtSlope, wtAtr, wtSR, wtNet, wtPos, wtMom, wtSwing, wtVol, swingStrengthFast, swingStrengthContext, swingBufferTicks, swingConfirmBars, swingCooldownBars, showSwingLine, showSignalLine, enableEarlyEntry, showEMA34);
 		}
 	}
 }
